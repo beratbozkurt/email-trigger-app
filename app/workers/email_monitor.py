@@ -311,33 +311,27 @@ def process_attachments():
 
         # Group attachments by document_type to use correct processors
         attachments_by_type = {}
+        unsupported_attachments = []
+        
         for att in attachments_to_extract:
             print(f"\nProcessing attachment: {att.filename}")
             print(f"Document type from classifier: {att.document_type}")
             print(f"Classification confidence: {att.classification_confidence}")
-            if att.classification_metadata:
-                print("Classification metadata:")
-                try:
-                    # Try to parse the metadata if it's a string
-                    if isinstance(att.classification_metadata, str):
-                        metadata = json.loads(att.classification_metadata)
-                    else:
-                        metadata = att.classification_metadata
-                    
-                    for entity in metadata:
-                        if isinstance(entity, dict):
-                            print(f"  - Type: {entity.get('type')}, Confidence: {entity.get('confidence')}, Text: {entity.get('mention_text')}")
-                        else:
-                            print(f"  - Entity: {entity}")
-                except Exception as e:
-                    print(f"  - Raw metadata: {att.classification_metadata}")
-
+            
             if att.document_type and att.document_type in DOCUMENT_AI_EXTRACTION_PROCESSOR_IDS:
                 if att.document_type not in attachments_by_type:
                     attachments_by_type[att.document_type] = []
                 attachments_by_type[att.document_type].append(att)
             else:
                 print(f"⚠️ Skipping attachment {att.filename}: No extraction processor defined for type '{att.document_type}'.")
+                unsupported_attachments.append(att)
+        
+        # Mark unsupported attachments as processed to avoid repeated attempts
+        if unsupported_attachments:
+            print(f"\n📝 Marking {len(unsupported_attachments)} unsupported attachments as processed to avoid repeated attempts:")
+            for att in unsupported_attachments:
+                att.last_extracted_at = datetime.now()
+                print(f"  - {att.filename} ({att.document_type})")
 
         # Dictionary to store all extracted data, organized by thread_id
         all_thread_data = {}
@@ -370,10 +364,12 @@ def process_attachments():
                                 "Entities": {}  # Store all entities here
                             }
                         
-                        # Add all entities to the thread data
+                        # Add all entities to the thread data with document type prefix
                         for entity_name, entity_value in extraction_result["extracted_data"].items():
                             if entity_value:  # Only add non-empty values
-                                all_thread_data[thread_id]["Entities"][entity_name] = entity_value
+                                # Prefix entity name with document type to differentiate same entities from different doc types
+                                prefixed_entity_name = f"{doc_type}_{entity_name}"
+                                all_thread_data[thread_id]["Entities"][prefixed_entity_name] = entity_value
                         
                         print(f"✅ Extracted data from {attachment.filename} ({doc_type}) in thread {thread_id}.")
                     else:
@@ -390,67 +386,190 @@ def process_attachments():
         db.commit() # Commit all last_extracted_at updates
         print("💾 Updated last_extracted_at timestamps in database.")
 
-        # Generate Excel report
+        # Generate Excel report with cumulative writing
         if all_thread_data:
-            # Get current week number and year
+            # Get current week number
             current_date = datetime.now()
             week_number = current_date.isocalendar()[1]
-            year = current_date.year
-            
-            # Get all unique entity names from all threads
-            all_entity_names = set()
-            for thread_data in all_thread_data.values():
-                all_entity_names.update(thread_data["Entities"].keys())
-            
-            # Create headers
-            headers = ["Thread ID", "Email Subject", "Email Sender", "Extraction Date"]
-            headers.extend(sorted(all_entity_names))  # Add all entity names as columns
             
             # Get the current week's file
             current_week_file = output_dir / f"current_week_extracts.xlsx"
             
-            # Check if we need to create a new file for the week
+            # Check if we need to archive the existing file for a new week
+            need_new_file = False
             if current_week_file.exists():
-                # Check if the file is from a previous week
                 try:
                     wb = load_workbook(current_week_file)
                     ws = wb.active
-                    # If we can read the file, it's the current week's file
-                except:
-                    # If we can't read the file, it's from a previous week
-                    # Rename it with the week number and create a new one
-                    if current_week_file.exists():
-                        old_week_file = output_dir / f"extracts_week{week_number-1}_{year}.xlsx"
-                        current_week_file.rename(old_week_file)
-                        wb = Workbook()
-                        ws = wb.active
-                        ws.title = f"Week {week_number}"
-                        ws.append(headers)
+                    
+                    # Check the week number from the worksheet title
+                    existing_week = None
+                    if ws.title and "Week" in ws.title:
+                        try:
+                            existing_week = int(ws.title.split("Week")[1].strip())
+                        except (ValueError, IndexError):
+                            pass
+                    
+                    # If week numbers don't match, archive the old file
+                    if existing_week and existing_week != week_number:
+                        year = current_date.year
+                        archived_file = output_dir / f"extracts_week{existing_week}_{year}.xlsx"
+                        current_week_file.rename(archived_file)
+                        print(f"📦 Archived previous week's file: {archived_file}")
+                        need_new_file = True
+                    
+                except Exception as e:
+                    print(f"⚠️ Could not check existing file week, archiving as backup: {e}")
+                    backup_file = output_dir / f"backup_{current_date.strftime('%Y%m%d_%H%M%S')}_extracts.xlsx"
+                    current_week_file.rename(backup_file)
+                    need_new_file = True
             else:
+                need_new_file = True
+            
+            # Load existing workbook or create new one
+            if current_week_file.exists() and not need_new_file:
+                try:
+                    wb = load_workbook(current_week_file)
+                    ws = wb.active
+                    
+                    # Get existing headers from the first row
+                    existing_headers = []
+                    if ws.max_row > 0:
+                        for cell in ws[1]:
+                            if cell.value:
+                                existing_headers.append(cell.value)
+                    
+                    # Get all unique entity names from current extraction + existing file
+                    all_entity_names = set()
+                    for thread_data in all_thread_data.values():
+                        all_entity_names.update(thread_data["Entities"].keys())
+                    
+                    # Add existing entity columns to preserve order
+                    if existing_headers:
+                        for header in existing_headers[4:]:  # Skip first 4 basic columns
+                            all_entity_names.add(header)
+                    
+                    # Create complete headers maintaining consistent order
+                    headers = ["Thread ID", "Email Subject", "Email Sender", "Extraction Date"]
+                    sorted_entities = sorted(all_entity_names)
+                    headers.extend(sorted_entities)
+                    
+                    # Update headers if new columns were added
+                    if len(headers) > len(existing_headers):
+                        # Clear the first row and rewrite with complete headers
+                        for col in range(1, len(headers) + 1):
+                            ws.cell(row=1, column=col, value=headers[col-1] if col <= len(headers) else "")
+                        
+                        # Update existing data rows with new columns (fill with empty strings)
+                        for row_idx in range(2, ws.max_row + 1):
+                            for col_idx in range(len(existing_headers) + 1, len(headers) + 1):
+                                ws.cell(row=row_idx, column=col_idx, value="")
+                    
+                    print(f"📊 Loaded existing Excel file for week {week_number} with {ws.max_row - 1} existing records")
+                    
+                except Exception as e:
+                    print(f"⚠️ Could not load existing file, creating new one: {e}")
+                    need_new_file = True
+            
+            if need_new_file or not current_week_file.exists():
                 # Create new workbook for the current week
                 wb = Workbook()
                 ws = wb.active
                 ws.title = f"Week {week_number}"
+                
+                # Create headers for new file
+                all_entity_names = set()
+                for thread_data in all_thread_data.values():
+                    all_entity_names.update(thread_data["Entities"].keys())
+                headers = ["Thread ID", "Email Subject", "Email Sender", "Extraction Date"]
+                headers.extend(sorted(all_entity_names))
                 ws.append(headers)
+                print(f"📄 Created new Excel file for week {week_number}")
             
-            # Write data rows - one row per thread
+            # Get existing thread data to update instead of skipping
+            existing_thread_rows = {}
+            current_headers = []
+            if ws.max_row > 0:
+                # Get current headers
+                for cell in ws[1]:
+                    if cell.value:
+                        current_headers.append(cell.value)
+                
+                # Map existing thread IDs to their row numbers and data
+                if ws.max_row > 1:
+                    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+                        if row and row[0]:  # Thread ID is in first column
+                            thread_id_str = str(row[0])
+                            existing_thread_rows[thread_id_str] = {
+                                'row_number': row_idx,
+                                'data': dict(zip(current_headers, row))
+                            }
+            
+            # Process thread data - update existing rows or add new ones
+            new_rows_added = 0
+            updated_rows = 0
+            
             for thread_id, thread_data in all_thread_data.items():
-                row_data = [
-                    thread_id,
-                    thread_data["Email Subject"],
-                    thread_data["Email Sender"],
-                    thread_data["Extraction Date"]
-                ]
+                thread_id_str = str(thread_id)
                 
-                # Add all entity values
-                for entity_name in sorted(all_entity_names):
-                    row_data.append(thread_data["Entities"].get(entity_name, ""))
-                
-                ws.append(row_data)
+                if thread_id_str in existing_thread_rows:
+                    # Update existing row with new data
+                    print(f"🔄 Updating existing thread {thread_id} with new extraction data")
+                    existing_row = existing_thread_rows[thread_id_str]
+                    row_number = existing_row['row_number']
+                    existing_data = existing_row['data']
+                    
+                    # Merge new entities with existing ones (new data takes precedence)
+                    merged_entities = existing_data.copy()
+                    
+                    # Update basic fields with latest extraction
+                    merged_entities["Extraction Date"] = thread_data["Extraction Date"]
+                    
+                    # Merge entity data - keep existing values, add new ones
+                    for entity_name, entity_value in thread_data["Entities"].items():
+                        if entity_value:  # Only update with non-empty values
+                            merged_entities[entity_name] = entity_value
+                    
+                    # Update the Excel row with merged data
+                    for col_idx, header in enumerate(current_headers, start=1):
+                        if header == "Thread ID":
+                            ws.cell(row=row_number, column=col_idx, value=thread_id)
+                        elif header == "Email Subject":
+                            ws.cell(row=row_number, column=col_idx, value=thread_data["Email Subject"])
+                        elif header == "Email Sender":
+                            ws.cell(row=row_number, column=col_idx, value=thread_data["Email Sender"])
+                        else:
+                            # Use merged data for all other fields
+                            ws.cell(row=row_number, column=col_idx, value=merged_entities.get(header, ""))
+                    
+                    updated_rows += 1
+                else:
+                    # Add new row for new thread
+                    print(f"➕ Adding new thread {thread_id} to Excel")
+                    
+                    row_data = []
+                    for header in current_headers:
+                        if header == "Thread ID":
+                            row_data.append(thread_id)
+                        elif header == "Email Subject":
+                            row_data.append(thread_data["Email Subject"])
+                        elif header == "Email Sender":
+                            row_data.append(thread_data["Email Sender"])
+                        elif header == "Extraction Date":
+                            row_data.append(thread_data["Extraction Date"])
+                        else:
+                            # This is an entity column
+                            row_data.append(thread_data["Entities"].get(header, ""))
+                    
+                    ws.append(row_data)
+                    new_rows_added += 1
             
             # Save the Excel file
             wb.save(current_week_file)
-            print(f"📊 Updated current week's Excel report: {current_week_file}")
+            print(f"📊 Excel report updated: {current_week_file}")
+            print(f"➕ Added {new_rows_added} new thread records")
+            print(f"🔄 Updated {updated_rows} existing thread records with new data")
+            print(f"📈 Total records in file: {ws.max_row - 1}")
         else:
             print("ℹ️ No data was successfully extracted to generate Excel reports.")
 
