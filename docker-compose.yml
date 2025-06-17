@@ -1,0 +1,73 @@
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_URL=http://localhost:8000
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/email_trigger
+      - REDIS_URL=redis://redis:6379/0
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/service-account.json
+      - GOOGLE_CLOUD_PROJECT=logistics-5u-ai
+      - DOCUMENT_AI_LOCATION=eu
+      - DOCUMENT_AI_PROCESSOR_ID=5710554318b4699b
+    volumes:
+      - .:/app
+      - ./credentials:/app/credentials
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --log-level debug
+
+  worker:
+    build: .
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/email_trigger
+      - REDIS_URL=redis://redis:6379/0
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/service-account.json
+      - GOOGLE_CLOUD_PROJECT=logistics-5u-ai
+      - DOCUMENT_AI_LOCATION=eu
+      - DOCUMENT_AI_PROCESSOR_ID=5710554318b4699b
+    volumes:
+      - .:/app
+      - ./credentials:/app/credentials
+    command: celery -A app.workers.celery_app worker --loglevel=info
+
+  beat:
+    build: .
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/email_trigger
+      - REDIS_URL=redis://redis:6379/0
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/service-account.json
+      - GOOGLE_CLOUD_PROJECT=logistics-5u-ai
+      - DOCUMENT_AI_LOCATION=eu
+      - DOCUMENT_AI_PROCESSOR_ID=5710554318b4699b
+    volumes:
+      - .:/app
+      - ./credentials:/app/credentials
+    command: celery -A app.workers.celery_app beat --loglevel=info
+
+  db:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=email_trigger
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:
